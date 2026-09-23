@@ -2,7 +2,7 @@
 
 A conversational agent that runs an Indian kirana store end-to-end over Telegram. No web app, no admin panel — the chat is the product.
 
-**Live bot:** `@<your_bot_username>`
+**Live bot:** `@Kirana_shop_nebula_bot`
 
 ---
 
