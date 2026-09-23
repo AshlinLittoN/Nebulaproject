@@ -1,0 +1,19 @@
+# Environment variables / secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# Local database
+kirana.db
+
+# Logs
+*.log
