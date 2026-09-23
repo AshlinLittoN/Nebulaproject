@@ -16,6 +16,7 @@ from agent import run_agent
 from tools.reports import sales_summary
 from tools.inventory import low_stock_report
 from tools.billing import finalize_bill, create_bill, add_item_to_bill, view_bill
+from tools.pdf_invoice import generate_invoice_pdf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 chat_histories: dict[str, list] = {}
 processed_updates: set[int] = set()
 bill_states: dict[str, dict] = {}
+last_bill: dict[str, str] = {}  # chat_id -> last finalized bill_number
 
 DISCOUNTS = {0: 2, 5: 3, 12: 5, 18: 7}
 
@@ -38,7 +40,7 @@ def _main_menu():
         [InlineKeyboardButton("📄 PDF Invoice", callback_data="pdf"),
          InlineKeyboardButton("📈 Analysis Deck", callback_data="pptx")],
         [InlineKeyboardButton("🔍 All Products", callback_data="products"),
-         InlineKeyboardButton("📋 Low Stock", callback_data="lowstock")],
+         InlineKeyboardButton("⚙️ Preferences", callback_data="preferences")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -197,7 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = chat_histories.get(chat_id, [])
     try:
         reply, updated_history, files = run_agent(chat_id, user_text, history)
-        chat_histories[chat_id] = updated_history[-20:]
+        chat_histories[chat_id] = updated_history[-10:]
         await send(reply, reply_markup=_main_menu())
         for fpath in files:
             with open(fpath, "rb") as f:
@@ -213,6 +215,7 @@ async def _do_finalize(chat_id, payment_mode, send_fn):
     if not result["ok"]:
         await send_fn(f"Error: {result['error']}", reply_markup=_main_menu())
         return
+    last_bill[chat_id] = result["bill_number"]  # remember for PDF
     lines = [
         "\u2705 *Bill Finalized!*",
         f"Bill: `{result['bill_number']}`",
@@ -269,6 +272,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send("Bill cancelled.", reply_markup=_main_menu())
         return
 
+    if query.data == "pdf":
+        bill_number = last_bill.get(chat_id)
+        if not bill_number:
+            # fallback: fetch latest finalized bill from DB
+            conn = get_conn()
+            row = conn.execute(
+                "SELECT bill_number FROM bills WHERE telegram_chat_id=? AND status='finalized' ORDER BY finalized_at DESC LIMIT 1",
+                (chat_id,)
+            ).fetchone()
+            conn.close()
+            bill_number = row["bill_number"] if row else None
+        if not bill_number:
+            await send("No finalized bill found.", reply_markup=_main_menu())
+            return
+        result = generate_invoice_pdf(bill_number)
+        if not result["ok"]:
+            await send(f"Error: {result['error']}", reply_markup=_main_menu())
+            return
+        with open(result["path"], "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, filename=f"{bill_number}.pdf")
+        return
+
     if query.data == "bill":
         await _start_bill_flow(chat_id, send)
         return
@@ -282,12 +307,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "pdf": "send me the last bill as PDF",
         "pptx": "generate sales analysis deck",
         "products": "list all products",
+        "preferences": "show all my preferences",
     }
     user_text = prompts.get(query.data, query.data)
     history = chat_histories.get(chat_id, [])
     try:
         reply, updated_history, files = run_agent(chat_id, user_text, history)
-        chat_histories[chat_id] = updated_history[-20:]
+        chat_histories[chat_id] = updated_history[-10:]
         await send(reply, reply_markup=_main_menu())
         for fpath in files:
             with open(fpath, "rb") as f:

@@ -4,32 +4,16 @@ Observe → Reason → Act (tool call) → Feed result back → Continue.
 """
 import json
 import os
+import re
 import time
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, BadRequestError
 from agent_tools import TOOLS, dispatch_tool
 from tools.memory import get_all_preferences
 
 MODEL = "qwen/qwen3.8-27b"
 
-SYSTEM_PROMPT = """You are a kirana store assistant. You ONLY answer by calling tools. Never make up data.
-
-CRITICAL RULES:
-- NEVER invent numbers, stock levels, prices, bill numbers, or sales data.
-- NEVER answer a data question without calling a tool first.
-- NEVER show a list of products without calling list_products first.
-- NEVER show sales figures without calling daily_close or sales_summary first.
-- NEVER show a bill without calling view_bill or get_bill_by_number first.
-- NEVER show stock without calling query_stock or list_products first.
-- If you have not called a tool, you do not have the data. Do not guess.
-- For bills: call create_bill ONCE, then add_item_to_bill for EACH item one by one, then finalize_bill.
-- Make ONE tool call at a time. Wait for the result before the next call.
-- Payment mode: use default_payment preference if set, else ask the owner.
-- Khata: add_credit = customer owes store. record_payment = customer pays back.
-- Amounts always in Rs. with 2 decimal places.
-- LANGUAGE: Reply in the same language the owner used (Hindi or English).
-- For barcodes: always use set_barcode and lookup_by_barcode tools.
-- Be concise.
-"""
+SYSTEM_PROMPT = """Kirana store assistant. Call tools only, never invent data.
+Rules: NEVER show stock/prices/bills/sales without calling the relevant tool first. For bills: create_bill once, add_item_to_bill per item, finalize_bill last. One tool call at a time. Khata: add_credit=owes store, record_payment=pays back. Amounts in Rs. 2 decimals. Reply in owner's language (Hindi/English). Be concise."""
 
 
 def _groq_tools():
@@ -56,15 +40,28 @@ def _get_client():
     return _client
 
 
+def _trim_tool_results(messages, max_chars=300):
+    """Truncate tool result content in history to reduce token count."""
+    trimmed = []
+    for m in messages:
+        if m.get("role") == "tool" and len(m.get("content", "")) > max_chars:
+            m = {**m, "content": m["content"][:max_chars] + "…"}
+        trimmed.append(m)
+    return trimmed
+
+
 def run_agent(chat_id: str, user_message: str, history: list) -> tuple[str, list, list]:
     prefs = get_all_preferences()
     pref_context = ""
     if prefs["preferences"]:
         pref_context = f"\n[Owner preferences: {json.dumps(prefs['preferences'])}]"
 
+    # Keep only last 10 messages and truncate large tool results
+    trimmed_history = _trim_tool_results(history[-10:])
+
     messages = (
         [{"role": "system", "content": SYSTEM_PROMPT}]
-        + history
+        + trimmed_history
         + [{"role": "user", "content": user_message + pref_context}]
     )
 
@@ -79,14 +76,35 @@ def run_agent(chat_id: str, user_message: str, history: list) -> tuple[str, list
                     messages=messages,
                     tools=groq_tools,
                     tool_choice="auto",
-                    max_tokens=800,
+                    max_tokens=400,
                     reasoning_effort="none",
                 )
                 break
-            except RateLimitError:
+            except RateLimitError as e:
+                msg_text = str(e)
+                # TPD (daily) limit — extract wait time and raise with friendly message
+                if "tokens per day" in msg_text or "TPD" in msg_text:
+                    m = re.search(r'try again in (\d+m[\d.]+s|[\d.]+s)', msg_text)
+                    wait_str = m.group(1) if m else "some time"
+                    raise RuntimeError(f"\u23f3 Daily token limit reached. Please try again in {wait_str}.")
+                # OTPM (per-minute) limit — wait and retry
                 if attempt == 2:
                     raise
                 time.sleep(15)
+            except BadRequestError as e:
+                # 413: input too large — drop half the history and retry
+                if "413" in str(e) or "Request too large" in str(e):
+                    if attempt == 2:
+                        raise
+                    keep = max(2, len(trimmed_history) // 2)
+                    trimmed_history = _trim_tool_results(trimmed_history[-keep:], max_chars=150)
+                    messages = (
+                        [{"role": "system", "content": SYSTEM_PROMPT}]
+                        + trimmed_history
+                        + [{"role": "user", "content": user_message + pref_context}]
+                    )
+                else:
+                    raise
 
         msg = response.choices[0].message
 
@@ -104,7 +122,7 @@ def run_agent(chat_id: str, user_message: str, history: list) -> tuple[str, list
 
         if not msg.tool_calls:
             saved = [m for m in messages if m.get("role") != "system"]
-            return msg.content or "", saved, files_to_send
+            return msg.content or "", saved[-10:], files_to_send
 
         for tc in msg.tool_calls:
             try:
